@@ -89,7 +89,7 @@ training_args = Seq2SeqTrainingArguments(
     gradient_accumulation_steps=2,  # Acumular gradientes para compensar batch pequeño
     learning_rate=1e-4,
     num_train_epochs=3,
-    fp16=True if device == "cuda" else False,
+    bf16=True if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else False,  # Use bf16 on newer GPUs if available
     logging_dir="./logs",
     logging_steps=10,
     save_steps=100,
