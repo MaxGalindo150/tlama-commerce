@@ -88,7 +88,7 @@ print(f"Validation examples: {len(eval_dataset)}")
 
 # Load the model and tokenizer
 # For Spanish tasks, consider using mT5 which handles multiple languages
-model_id = "google/mt5-large"  # Try mT5 for better multilingual support
+model_id = "google/mt5-base"  # Try mT5 for better multilingual support
 print(f"Loading model: {model_id}")
 
 # Check if we need model config modifications
