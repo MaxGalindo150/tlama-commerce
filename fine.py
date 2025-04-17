@@ -1,12 +1,13 @@
 import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, Seq2SeqTrainingArguments, Seq2SeqTrainer
-from transformers.integrations import TensorBoardCallback
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer, Seq2SeqTrainingArguments, Seq2SeqTrainer, AutoConfig
 from datasets import Dataset
 import json
 import numpy as np
 import os
-from torch.utils.tensorboard import SummaryWriter
 import random
+from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
+import pandas as pd
 
 # Set random seed for reproducibility
 seed = 42
@@ -24,159 +25,194 @@ print(f"Using device: {device}")
 with open('eigencore_dataset.json', 'r', encoding='utf-8') as f:
     data = json.load(f)
 
-# Prepare the dataset for T5
-train_data = []
-for example in data:
+# Analyze dataset
+print(f"Dataset size: {len(data)} examples")
+
+# Check for potential issues
+valid_examples = []
+skipped_examples = []
+for i, example in enumerate(data):
     if 'input' in example and ('target' in example or 'output' in example):
         question = example['input']
         answer = example['target'] if 'target' in example else example['output']
-        train_data.append({
+        
+        # Validate example
+        if not isinstance(question, str) or not isinstance(answer, str):
+            skipped_examples.append((i, "Non-string input or output"))
+            continue
+            
+        if len(question.strip()) < 2 or len(answer.strip()) < 2:
+            skipped_examples.append((i, "Too short input or output"))
+            continue
+        
+        valid_examples.append({
             "input_text": question,
             "target_text": answer
         })
+    else:
+        skipped_examples.append((i, "Missing input or target/output"))
 
-# Shuffle the data
-random.shuffle(train_data)
+print(f"Valid examples: {len(valid_examples)}")
+print(f"Skipped examples: {len(skipped_examples)}")
+
+if skipped_examples:
+    print("Sample of skipped examples:")
+    for i in range(min(5, len(skipped_examples))):
+        print(f"  Example {skipped_examples[i][0]}: {skipped_examples[i][1]}")
+
+# Analyze text lengths
+input_lengths = [len(ex["input_text"]) for ex in valid_examples]
+target_lengths = [len(ex["target_text"]) for ex in valid_examples]
+
+print(f"Input text length: min={min(input_lengths)}, max={max(input_lengths)}, avg={sum(input_lengths)/len(input_lengths):.1f}")
+print(f"Target text length: min={min(target_lengths)}, max={max(target_lengths)}, avg={sum(target_lengths)/len(target_lengths):.1f}")
 
 # Print some examples to verify
-print("Dataset examples:")
-for i in range(min(3, len(train_data))):
+print("\nDataset examples:")
+for i in range(min(3, len(valid_examples))):
     print(f"Example {i+1}:")
-    print(f"  Input: {train_data[i]['input_text'][:100]}...")
-    print(f"  Target: {train_data[i]['target_text'][:100]}...")
+    print(f"  Input: {valid_examples[i]['input_text']}")
+    print(f"  Target: {valid_examples[i]['target_text'][:100]}...")
 
-# Convert to Hugging Face datasets format
-train_dataset = Dataset.from_list(train_data)
+# Shuffle and convert to Hugging Face datasets format
+random.shuffle(valid_examples)
+train_dataset = Dataset.from_list(valid_examples)
 
 # Split the dataset into training and validation
 train_test_split = train_dataset.train_test_split(test_size=0.1, seed=seed)
 train_dataset = train_test_split["train"]
 eval_dataset = train_test_split["test"]
 
-print(f"Training examples: {len(train_dataset)}")
+print(f"\nTraining examples: {len(train_dataset)}")
 print(f"Validation examples: {len(eval_dataset)}")
 
 # Load the model and tokenizer
-model_id = "google/flan-t5-large"  # Consider starting with base model if memory issues
+# For Spanish tasks, consider using mT5 which handles multiple languages
+model_id = "google/mt5-large"  # Try mT5 for better multilingual support
 print(f"Loading model: {model_id}")
+
+# Check if we need model config modifications
+config = AutoConfig.from_pretrained(model_id)
+print(f"Model config: {config}")
+
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-# Load the model with fp32 for stability in initial training
+# Set the padding token if not explicitly set
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# Ensure special tokens are handled properly
+print(f"Special tokens: {tokenizer.all_special_tokens}")
+print(f"Vocab size: {tokenizer.vocab_size}")
+
+# Load the model with fp32 for stability
 print("Loading model with fp32 precision for improved stability")
 model = AutoModelForSeq2SeqLM.from_pretrained(
     model_id,
+    config=config,
     device_map="auto" if device == "cuda" else None
 )
 
-# Create a callback for gradient monitoring
-class GradientMonitorCallback(TensorBoardCallback):
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if state.global_step % 100 == 0:  # Log every 100 steps
-            for name, param in model.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    writer = self.tb_writer
-                    writer.add_histogram(f"gradients/{name}", param.grad, state.global_step)
-                    writer.add_scalar(f"gradient_norm/{name}", param.grad.norm().item(), state.global_step)
+# Very important for T5: check that the model has the right vocab size
+if model.config.vocab_size != tokenizer.vocab_size:
+    print(f"Warning: Model vocab size ({model.config.vocab_size}) != Tokenizer vocab size ({tokenizer.vocab_size})")
+    # Resize model embeddings to match tokenizer
+    model.resize_token_embeddings(len(tokenizer))
 
-# Tokenize the dataset with improved handling
+# Define a correct prompt prefix for this task (Spanish generation)
+prompt_prefix = "pregunta: "
+answer_prefix = "respuesta: "
+
+# Improved tokenize function with proper prefix for Spanish tasks
 def tokenize_function(examples):
-    # Prepare input with task prefix
-    inputs = ["translate Spanish to English: " + text for text in examples["input_text"]]
+    # Prepare inputs with correct task prefix for Spanish
+    inputs = [prompt_prefix + text for text in examples["input_text"]]
+    targets = [answer_prefix + text for text in examples["target_text"]]
     
-    # Tokenize inputs
-    model_inputs = tokenizer(
+    # Tokenize inputs with fixed max length
+    input_encoding = tokenizer(
         inputs, 
-        max_length=512, 
-        padding="max_length", 
+        padding="max_length",
+        max_length=128,  # Adjust based on your input length analysis
         truncation=True,
         return_tensors="pt"
     )
     
-    # Tokenize targets - don't pad to max_length
-    with tokenizer.as_target_tokenizer():
-        labels = tokenizer(
-            examples["target_text"], 
-            max_length=512, 
-            truncation=True,
-            padding=False
-        )
+    # Tokenize targets separately
+    target_encoding = tokenizer(
+        targets,
+        padding="max_length",
+        max_length=512,  # Adjust based on target length analysis
+        truncation=True,
+        return_tensors="pt"
+    )
     
-    # Convert to tensors and assign to inputs
-    model_inputs["labels"] = labels["input_ids"]
+    # Replace pad token with -100 for loss calculation
+    labels = target_encoding["input_ids"].clone()
+    labels[labels == tokenizer.pad_token_id] = -100
+    
+    # Combine into a single batch
+    model_inputs = {
+        "input_ids": input_encoding["input_ids"],
+        "attention_mask": input_encoding["attention_mask"],
+        "labels": labels
+    }
     
     return model_inputs
 
-print("Tokenizing datasets...")
-tokenized_train = train_dataset.map(tokenize_function, batched=True, remove_columns=train_dataset.column_names)
-tokenized_eval = eval_dataset.map(tokenize_function, batched=True, remove_columns=eval_dataset.column_names)
+print("\nTokenizing datasets...")
+tokenized_train = train_dataset.map(
+    tokenize_function, 
+    batched=True, 
+    remove_columns=train_dataset.column_names,
+    batch_size=16
+)
+tokenized_eval = eval_dataset.map(
+    tokenize_function, 
+    batched=True, 
+    remove_columns=eval_dataset.column_names,
+    batch_size=16
+)
 
 # Verify tokenized data
-print("Verifying tokenized data:")
+print("\nVerifying tokenized data:")
 sample = tokenized_train[0]
 print("Input IDs sample:", sample["input_ids"][:10])
-print("Input text decoded:", tokenizer.decode(sample["input_ids"], skip_special_tokens=True)[:50])
-print("Label IDs sample:", sample["labels"][:10])
-print("Label text decoded:", tokenizer.decode([l for l in sample["labels"] if l != -100], skip_special_tokens=True)[:50])
+print("Input text decoded:", tokenizer.decode(sample["input_ids"], skip_special_tokens=True))
+print("Label sample:", [l for l in sample["labels"][:10] if l != -100])
+print("Label text decoded:", tokenizer.decode([l for l in sample["labels"] if l != -100], skip_special_tokens=True))
 
-# Function to prepare batched labels properly
-def data_collator(features):
-    batch = {}
-    
-    # Prepare input_ids, attention_mask as usual
-    input_keys = ["input_ids", "attention_mask"]
-    for key in input_keys:
-        if key not in features[0]:
-            continue
-        batch[key] = torch.stack([torch.tensor(f[key]) for f in features])
-    
-    # Handle labels specially - pad to max length in batch
-    if "labels" in features[0]:
-        label_lengths = [len(f["labels"]) for f in features]
-        max_label_length = max(label_lengths)
-        
-        labels = []
-        for f in features:
-            padding_length = max_label_length - len(f["labels"])
-            labels.append(
-                f["labels"] + [-100] * padding_length
-            )
-        
-        batch["labels"] = torch.tensor(labels)
-    
-    return batch
-
-# Configure training arguments with lower learning rate and gradient clipping
+# Training args with more conservative settings
 training_args = Seq2SeqTrainingArguments(
-    output_dir="./flan-t5-large-eigencore-fixed",
-    per_device_train_batch_size=4,  # Smaller batch size for stability
-    per_device_eval_batch_size=4,
-    gradient_accumulation_steps=4,  # Increased to maintain effective batch size
-    learning_rate=5e-5,  # Lower learning rate
+    output_dir="./mt5-spanish-generation",
+    per_device_train_batch_size=2,  # Smaller batch size for stability
+    per_device_eval_batch_size=2,
+    gradient_accumulation_steps=8,  # Maintain effective batch size of 16
+    learning_rate=2e-5,  # Very conservative learning rate
     num_train_epochs=5,
-    fp16=False,  # Start with fp32 for stability
-    bf16=False,
-    logging_dir="./logs",
+    fp16=False,  # Use fp32 for stability
+    logging_dir="./logs-mt5",
     logging_steps=10,
-    save_steps=100,
-    eval_steps=100,
+    save_steps=50,
+    eval_steps=50,
     save_total_limit=3,
     predict_with_generate=True,
+    generation_max_length=512,
+    generation_num_beams=4,
     gradient_checkpointing=True,
     weight_decay=0.01,
     warmup_ratio=0.1,
-    lr_scheduler_type="linear",  # Changed to linear for more stable warmup
+    lr_scheduler_type="linear",
     load_best_model_at_end=True,
     metric_for_best_model="eval_loss",
     greater_is_better=False,
     report_to="tensorboard",
     eval_strategy="steps",
-    max_grad_norm=1.0,  # Add gradient clipping
-    generation_max_length=512,
-    generation_num_beams=4,
+    max_grad_norm=1.0,  # Gradient clipping
     seed=seed,
 )
 
-# Define metrics calculation
+# Define better metrics calculation
 def compute_metrics(eval_preds):
     predictions, labels = eval_preds
     # Decode predictions
@@ -186,16 +222,23 @@ def compute_metrics(eval_preds):
     labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
     decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
     
-    # Calculate exact match accuracy
-    exact_matches = sum(pred.strip() == label.strip() for pred, label in zip(decoded_preds, decoded_labels))
-    exact_match_accuracy = exact_matches / len(decoded_preds)
+    # Remove prefixes for cleaner comparison
+    cleaned_preds = [pred.replace(answer_prefix, "").strip() for pred in decoded_preds]
+    cleaned_labels = [label.replace(answer_prefix, "").strip() for label in decoded_labels]
+    
+    # Calculate metrics
+    exact_matches = sum(pred == label for pred, label in zip(cleaned_preds, cleaned_labels))
+    exact_match_accuracy = exact_matches / len(cleaned_preds)
+    
+    # Calculate BLEU or other metrics here if needed
     
     # Print a few examples for visual inspection
     print("\nPrediction samples:")
-    for i in range(min(3, len(decoded_preds))):
-        print(f"Input: {tokenizer.decode(eval_dataset[i]['input_text'], skip_special_tokens=True)}")
-        print(f"Pred: {decoded_preds[i]}")
-        print(f"True: {decoded_labels[i]}")
+    for i in range(min(3, len(cleaned_preds))):
+        input_text = eval_dataset[i]["input_text"]
+        print(f"Input: {input_text}")
+        print(f"Pred: {cleaned_preds[i][:100]}...")
+        print(f"True: {cleaned_labels[i][:100]}...")
         print()
     
     return {
@@ -205,6 +248,10 @@ def compute_metrics(eval_preds):
 # Create tensorboard writer
 tb_writer = SummaryWriter(log_dir=training_args.logging_dir)
 
+# Early stopping callback to prevent overfitting
+from transformers.trainer_callback import EarlyStoppingCallback
+early_stopping = EarlyStoppingCallback(early_stopping_patience=3)
+
 # Configure the trainer
 trainer = Seq2SeqTrainer(
     model=model,
@@ -213,41 +260,71 @@ trainer = Seq2SeqTrainer(
     eval_dataset=tokenized_eval,
     tokenizer=tokenizer,
     compute_metrics=compute_metrics,
-    data_collator=data_collator,
-    callbacks=[GradientMonitorCallback(tb_writer=tb_writer)],
+    callbacks=[early_stopping],
 )
 
-# Enable model debugging
+# Enable debug mode for more informative errors
 torch.autograd.set_detect_anomaly(True)
+
+# Function to test model generation
+def test_model_generation(model, tokenizer, input_texts, device):
+    model.eval()
+    results = []
+    
+    for input_text in input_texts:
+        # Prepare input
+        encoded_input = tokenizer(
+            prompt_prefix + input_text, 
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=128
+        ).to(device)
+        
+        # Generate
+        with torch.no_grad():
+            output = model.generate(
+                input_ids=encoded_input.input_ids,
+                attention_mask=encoded_input.attention_mask,
+                max_length=512,
+                num_beams=4,
+                early_stopping=True,
+                no_repeat_ngram_size=2
+            )
+        
+        # Decode
+        decoded_output = tokenizer.decode(output[0], skip_special_tokens=True)
+        # Clean prefix if present
+        if decoded_output.startswith(answer_prefix):
+            decoded_output = decoded_output[len(answer_prefix):].strip()
+            
+        results.append({
+            "input": input_text,
+            "output": decoded_output
+        })
+    
+    return results
 
 # Start training with proper error handling
 try:
-    print("Starting training...")
+    print("\nStarting training...")
     trainer.train()
     
     # Save the model
-    model_path = "./flan-t5-large-eigencore-fixed-final"
+    model_path = "./mt5-spanish-generation-final"
     trainer.save_model(model_path)
     tokenizer.save_pretrained(model_path)
     print(f"Model saved to {model_path}")
     
-    # Test the model on a few examples
-    print("\nTesting trained model on a few examples:")
-    for i in range(min(5, len(eval_dataset))):
-        input_text = eval_dataset[i]["input_text"]
-        inputs = tokenizer("translate Spanish to English: " + input_text, return_tensors="pt").to(device)
-        
-        outputs = model.generate(
-            inputs.input_ids,
-            max_length=512,
-            num_beams=4,
-            early_stopping=True
-        )
-        
-        prediction = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(f"Input: {input_text}")
-        print(f"Prediction: {prediction}")
-        print(f"Target: {eval_dataset[i]['target_text']}")
+    # Test the model on examples
+    print("\nTesting trained model on examples:")
+    test_inputs = [ex["input_text"] for ex in eval_dataset.select(range(5))]
+    test_outputs = test_model_generation(model, tokenizer, test_inputs, device)
+    
+    for i, result in enumerate(test_outputs):
+        print(f"Input: {result['input']}")
+        print(f"Generated: {result['output']}")
+        print(f"Expected: {eval_dataset[i]['target_text'][:100]}...")
         print()
 
 except Exception as e:
