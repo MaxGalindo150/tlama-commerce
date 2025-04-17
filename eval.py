@@ -14,7 +14,7 @@ def parse_arguments():
                         help="Path to the base model for comparison")
     parser.add_argument("--test_file", type=str, default=None,
                         help="Path to a JSON file with test questions (optional)")
-    parser.add_argument("--precision", type=str, choices=["fp16", "fp32", "bf16"], default="fp16",
+    parser.add_argument("--precision", type=str, choices=["fp16", "fp32", "bf16"], default="fp32",
                         help="Precision for model inference")
     parser.add_argument("--max_length", type=int, default=512,
                         help="Maximum length for generation")
